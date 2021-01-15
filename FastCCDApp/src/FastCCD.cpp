@@ -8,7 +8,6 @@
 #include <string.h>
 #include <string>
 #include <unistd.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 
 #include <epicsTime.h>
@@ -236,7 +235,11 @@ void FastCCD::processImage(cin_data_frame_t *frame)
   getIntegerParam(NDArrayCallbacks, &arrayCallbacks);
   if (arrayCallbacks) {
     /* Call the NDArray callback */
+    /* Must release the lock here, or we can get into a deadlock, because we can
+     * block on the plugin lock, and the plugin can be calling us */
+    this->unlock();
     doCallbacksGenericPointer(pImage, NDArrayData, 0);
+    this->lock();
   }
 
  
@@ -889,8 +892,6 @@ asynStatus FastCCD::writeFloat64(asynUser *pasynUser, epicsFloat64 value){
     if(_status){
       setParamStatus(function, asynError);
       status = asynError;
-    } else {
-      setParamStatus(function, asynSuccess);
     }
 
     if(status){
@@ -1402,6 +1403,7 @@ void FastCCD::getCameraStatus(int first_run){
       setIntegerParam(FastCCDFabFPGAVersion, id.fabric_fpga_ver);
       char buffer[50];
       sprintf(buffer, "0x%04X", id.fabric_fpga_ver);
+      fprintf(stderr, "Status Firmware = %s\n", buffer);
       setStringParam(ADFirmwareVersion, (char *)buffer);
 
       setParamStatus(FastCCDBaseBoardID, asynSuccess);
@@ -1626,6 +1628,8 @@ void FastCCD::getCameraStatus(int first_run){
       cin_status = cin_com_get_timing(&cin_ctl, &cin_data, &mode);
       if(cin_status == CIN_OK)
       {
+        fprintf(stderr, "status = %d, mode = %d\n", cin_status, mode);
+
         int _val1, _val2, _x, _y;
         cin_data_get_descramble_params(&cin_data, &_val1, &_val2, &_x, &_y);
         setIntegerParam(ADSizeX, _x);
@@ -1645,30 +1649,31 @@ void FastCCD::getCameraStatus(int first_run){
 
       int trig;
       cin_status = cin_ctl_get_triggering(&cin_ctl, &trig);
-      if(!cin_status)
-      {
-        if(trig)
-        {
+      if(!cin_status){
+        if(trig){
           setIntegerParam(ADAcquire, 1);
           setIntegerParam(ADStatus, ADStatusAcquire);
           float _exp, _cycle;
           cin_status = cin_ctl_get_exposure_time(&cin_ctl, &_exp);
           cin_status |= cin_ctl_get_cycle_time(&cin_ctl, &_cycle);
-          setDoubleParam(ADAcquirePeriod, _cycle);
-          setDoubleParam(ADAcquireTime, _exp);
-          setParamStatus(ADAcquirePeriod, asynSuccess);
-          setParamStatus(ADAcquireTime, asynSuccess);
+          fprintf(stderr, "%f, %f\n", _exp, _cycle);
+          if(!cin_status)
+          {
+            setDoubleParam(ADAcquirePeriod, _cycle);
+            setDoubleParam(ADAcquireTime, _exp);
+            setParamStatus(ADAcquirePeriod, asynSuccess);
+            setParamStatus(ADAcquireTime, asynSuccess);
+          } else {
+            setParamStatus(ADAcquirePeriod, asynDisconnected);
+            setParamStatus(ADAcquireTime, asynDisconnected);
+          }
         } else {
           setIntegerParam(ADAcquire, 0);
           setIntegerParam(ADStatus, ADStatusIdle);
         }
         setParamStatus(ADStatus, asynSuccess);
-        setParamStatus(ADAcquire, asynSuccess);
       } else {
         setParamStatus(ADStatus, asynDisconnected);
-        setParamStatus(ADAcquire, asynDisconnected);
-        setParamStatus(ADAcquirePeriod, asynDisconnected);
-        setParamStatus(ADAcquireTime, asynDisconnected);
       }
     }
     
@@ -1785,6 +1790,11 @@ void FastCCD::statusTask(void)
         "%s:%s: Got status event\n",
         driverName, functionName);
     }
+    // Failed to connect, keep trying
+    else {
+        this->connectCamera();
+	asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "Failed to connect to camera, retrying...\n");
+    }
 
     // Update the ticktock
     
@@ -1888,19 +1898,7 @@ static void FastCCDDetectorWaitTaskC(void *drvPvt)
   pPvt->detectorWaitTask();
 }
 
-extern "C" {
-
-/** IOC shell configuration command for debug output
-  * \param[in] error (0 = no error output, 1 = error output to stderr)
-  * \param[in] debug (0 = no debug output, 1 = debug output to stderr)
-  */
-void FastCCDDebug(int error, int debug)
-{
-  cin_set_debug_print(error);
-  cin_set_error_print(debug);
-}
-
-/** IOC shell configuration command for FastCCD driver
+/** IOC shell configuration command for Andor driver
   * \param[in] portName The name of the asyn port driver to be created.
   * \param[in] maxBuffers The maximum number of NDArray buffers that the NDArrayPool for this driver is 
   *            allowed to allocate. Set this to -1 to allow an unlimited number of buffers.
@@ -1914,6 +1912,14 @@ void FastCCDDebug(int error, int debug)
   * \param[in] fabricIP The fabric IP address
   * \param[in] fabricMAC The fabric MAC address
   */
+extern "C" {
+
+void FastCCDDebug(int error, int debug)
+{
+  cin_set_debug_print(error);
+  cin_set_error_print(debug);
+}
+
 int FastCCDConfig(const char *portName, int maxBuffers, size_t maxMemory, 
                   int priority, int stackSize, int packetBuffer, int imageBuffer,
 				  const char *baseIP, const char *fabricIP, const char *fabricMAC)
